@@ -29,6 +29,27 @@ const misparimAnalytics = (() => {
       [navigator.doNotTrack, window.doNotTrack].some(flag => flag === '1' || flag === 'yes') ||
       navigator.globalPrivacyControl === true) return null;
 
+  const sink = 'https://misparim-event-ingest.yonag.chatgpt.site/collect';
+  const returnKey = 'misparim.last-practice-day.v1';
+  let practiceDay=null, liveLanguage=null;
+  const dayFormat = new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Jerusalem'});
+  function transmit(stats) {
+    try {
+      void fetch(sink,{method:'POST',mode:'cors',credentials:'omit',cache:'no-store',referrerPolicy:'no-referrer',
+        keepalive:true,headers:{'Content-Type':'text/plain;charset=UTF-8'},body:JSON.stringify(stats)}).catch(()=>{});
+    } catch (_) {}
+  }
+  function returnOnLaterDay(){
+    const day=dayFormat.format(new Date());
+    if (practiceDay===day) return false;
+    let previous=null;
+    try {
+      previous=localStorage.getItem(returnKey);
+      localStorage.setItem(returnKey,day);
+    } catch (_) {}
+    practiceDay=day;
+    return typeof previous==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(previous)&&previous<day;
+  }
   const page = { website, hostname, url };
   const pending = [];
   let ready = false, failed = false;
@@ -58,10 +79,12 @@ const misparimAnalytics = (() => {
   script.onerror = () => { failed = true; pending.length = 0; };
   document.head.appendChild(script);
   return (phase, fields) => {
-    if (failed || !fields || !/^(digits|hebrew|say|nouns|mixed)$/.test(fields.mode)) return;
+    if (!fields || !/^(digits|hebrew|say|nouns|mixed)$/.test(fields.mode)) return;
     let event;
     if (phase==='start') {
       if (!/^(en|he|es|pt|hr|it|ar|zh-Hans)$/.test(fields.language)) return;
+      liveLanguage=fields.language;
+      transmit({phase:'start',mode:fields.mode,language:liveLanguage,retry:fields.review===true,returnDay:returnOnLaterDay()});
       event={...page,name:'exercise_start',data:{ui_language:fields.language,mode:fields.mode,is_retry:fields.review===true}};
     } else if (phase==='end') {
       const answerCount = n => Number.isInteger(n) && n>=0 && n<=10000;
@@ -73,8 +96,18 @@ const misparimAnalytics = (() => {
         if(![b.shown,b.attempted,b.wrong].every(answerCount)||b.wrong>b.attempted||b.attempted>b.shown)return;
         breakdown[k+'_shown']=b.shown;breakdown[k+'_attempted']=b.attempted;breakdown[k+'_wrong']=b.wrong;
       }
+      if (liveLanguage) {
+        const totals={};
+        for(const k of ['n0','n1_10','n11_20','n21_99','n100']){
+          const b=fields.buckets?.[k];if(b)totals[k]={shown:b.shown,attempted:b.attempted,wrong:b.wrong};
+        }
+        transmit({phase:'end',mode:fields.mode,language:liveLanguage,retry:fields.is_retry===true,completed:fields.completed===true,
+          answered:fields.answered,correct:fields.correct,mistakes:fields.mistakes,active_seconds:fields.active_seconds,buckets:totals});
+        liveLanguage=null;
+      }
       event={...page,name:'exercise_end',data:{mode:fields.mode,is_retry:fields.is_retry===true,completed:fields.completed===true,answered:fields.answered,correct:fields.correct,mistakes:fields.mistakes,active_seconds:fields.active_seconds,...breakdown}};
     } else return;
+    if (failed) return;
     if (ready) track(event);
     else if (pending.length < 20) pending.push(event);
   };
